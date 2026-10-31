@@ -227,8 +227,8 @@ private:
 
 class PyConsumer {
 public:
-    PyConsumer(const std::string& name) {
-        buffer_ = ipc::SpscRingBuffer::open(name);
+    PyConsumer(const std::string& name, uint32_t wait_ready_ms = 5000) {
+        buffer_ = ipc::SpscRingBuffer::open(name, wait_ready_ms);
     }
 
     std::unique_ptr<PyFrameLease> receive(uint32_t spin_count = 2048, uint32_t timeout_ms = 1000) {
@@ -308,7 +308,7 @@ NB_MODULE(_core, m) {
         .def("arena_capacity", &PyProducer::arena_capacity);
 
     nb::class_<PyConsumer>(m, "Consumer")
-        .def(nb::init<const std::string&>(), "name"_a)
+        .def(nb::init<const std::string&, uint32_t>(), "name"_a, "wait_ready_ms"_a = 5000)
         .def("receive", &PyConsumer::receive, "spin_count"_a = 2048, "timeout_ms"_a = 1000)
         .def("shutdown", &PyConsumer::shutdown)
         .def("is_shutdown", &PyConsumer::is_shutdown)

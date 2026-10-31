@@ -10,6 +10,11 @@
 #include <stdexcept>
 #include <string>
 #include <chrono>
+#include <thread>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace ipc {
 
@@ -23,7 +28,6 @@ inline bool is_power_of_two(uint64_t val) noexcept {
 
 class SpscRingBuffer {
 public:
-    // Calculates total shared memory size required for header, slots, and data arena
     static size_t calculate_total_shm_size(uint32_t ring_capacity, uint64_t data_arena_capacity) {
         if (!is_power_of_two(ring_capacity)) {
             throw std::invalid_argument("ring_capacity must be a power of two");
@@ -34,7 +38,6 @@ public:
         return header_size + slots_size + arena_size;
     }
 
-    // Producer factory: creates a new shared memory region and initializes layout
     static std::unique_ptr<SpscRingBuffer> create(const std::string& name, uint32_t ring_capacity, uint64_t data_arena_capacity) {
         if (!is_power_of_two(ring_capacity)) {
             throw std::invalid_argument("ring_capacity must be a power of two");
@@ -44,23 +47,46 @@ public:
 
         auto* buf = new SpscRingBuffer(std::move(region), true);
         buf->init_header(ring_capacity, data_arena_capacity, total_size);
+        buf->init_sync(name);
         return std::unique_ptr<SpscRingBuffer>(buf);
     }
 
-    // Consumer factory: opens an existing shared memory region
-    static std::unique_ptr<SpscRingBuffer> open(const std::string& name) {
-        auto region = SharedMemoryRegion::open(name);
+    static std::unique_ptr<SpscRingBuffer> open(const std::string& name, uint32_t wait_ready_ms = 5000) {
+        auto start = std::chrono::steady_clock::now();
+        std::unique_ptr<SharedMemoryRegion> region;
+        while (true) {
+            try {
+                region = SharedMemoryRegion::open(name);
+                break;
+            } catch (...) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                if (elapsed >= wait_ready_ms) {
+                    throw;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+
         auto* buf = new SpscRingBuffer(std::move(region), false);
+        while (buf->header_->magic != kMagicNumber) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed >= wait_ready_ms) {
+                delete buf;
+                throw std::runtime_error("Timed out waiting for shared memory segment initialization");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
         buf->validate_header();
+        buf->init_sync(name);
         return std::unique_ptr<SpscRingBuffer>(buf);
     }
 
     ~SpscRingBuffer() {
-        if (header_) {
-            header_->flags.fetch_or(ShmFlag_Shutdown, std::memory_order_release);
-            SyncWait::wake_all(header_->head);
-            SyncWait::wake_all(header_->tail);
-        }
+        shutdown();
+        close_sync();
     }
 
     SpscRingBuffer(const SpscRingBuffer&) = delete;
@@ -74,9 +100,11 @@ public:
     }
 
     void shutdown() noexcept {
-        header_->flags.fetch_or(ShmFlag_Shutdown, std::memory_order_release);
-        SyncWait::wake_all(header_->head);
-        SyncWait::wake_all(header_->tail);
+        if (header_) {
+            header_->flags.fetch_or(ShmFlag_Shutdown, std::memory_order_release);
+            wake_head();
+            wake_tail();
+        }
     }
 
     // --- PRODUCER API ---
@@ -93,49 +121,54 @@ public:
         }
 
         const uint32_t cap = header_->ring_capacity;
+        const uint32_t mask = cap - 1;
         const uint64_t current_head = header_->head.load(std::memory_order_relaxed);
 
         // 1. Wait for ring buffer slot availability (head - tail < cap)
-        while ((current_head - header_->tail.load(std::memory_order_acquire)) >= cap) {
+        uint64_t current_tail = header_->tail.load(std::memory_order_acquire);
+        while ((current_head - current_tail) >= cap) {
             if (is_shutdown()) return false;
-            if (!SyncWait::wait_change(header_->tail, header_->tail.load(std::memory_order_relaxed), spin_count, timeout_ms)) {
+            if (!wait_tail(current_tail, spin_count, timeout_ms)) {
                 if (is_shutdown()) return false;
+                current_tail = header_->tail.load(std::memory_order_acquire);
+                if ((current_head - current_tail) >= cap) return false;
+            } else {
+                current_tail = header_->tail.load(std::memory_order_acquire);
             }
         }
 
-        // 2. Manage arena space: contiguous allocation with wrap-around check
-        uint64_t arena_write_pos = header_->arena_head.load(std::memory_order_relaxed);
-        uint64_t arena_read_pos = header_->arena_tail.load(std::memory_order_acquire);
+        // 2. Arena allocation with wraparound
+        uint64_t arena_pos = header_->arena_head.load(std::memory_order_relaxed);
 
-        // If payload doesn't fit in remaining space towards end of arena, wrap to 0
-        bool wrapped = false;
-        if (arena_write_pos + aligned_size > header_->data_arena_capacity) {
-            // Must wrap to beginning of arena
-            // Ensure consumer has progressed past offset 0
-            while (arena_read_pos <= aligned_size && arena_write_pos >= arena_read_pos && (header_->head.load(std::memory_order_relaxed) != header_->tail.load(std::memory_order_acquire))) {
-                if (is_shutdown()) return false;
-                if (!SyncWait::wait_change(header_->arena_tail, arena_read_pos, spin_count, timeout_ms)) {
-                    if (is_shutdown()) return false;
+        while (true) {
+            current_tail = header_->tail.load(std::memory_order_acquire);
+            bool empty = (current_head == current_tail);
+            uint64_t oldest_offset = empty ? UINT64_MAX : slots_[current_tail & mask].data_offset;
+
+            if (arena_pos + aligned_size <= header_->data_arena_capacity) {
+                // Linear fit
+                if (empty || oldest_offset <= arena_pos || (arena_pos + aligned_size <= oldest_offset)) {
+                    break;
                 }
-                arena_read_pos = header_->arena_tail.load(std::memory_order_acquire);
+            } else {
+                // Wraparound to beginning of arena
+                if (empty || oldest_offset >= aligned_size) {
+                    arena_pos = 0;
+                    break;
+                }
             }
-            arena_write_pos = 0;
-            wrapped = true;
-        } else {
-            // Fits linearly, ensure write does not lap read position
-            while (arena_write_pos < arena_read_pos && (arena_write_pos + aligned_size) > arena_read_pos) {
+
+            // Space exhausted: wait for consumer to advance tail
+            if (is_shutdown()) return false;
+            if (!wait_tail(current_tail, spin_count, timeout_ms)) {
                 if (is_shutdown()) return false;
-                if (!SyncWait::wait_change(header_->arena_tail, arena_read_pos, spin_count, timeout_ms)) {
-                    if (is_shutdown()) return false;
-                }
-                arena_read_pos = header_->arena_tail.load(std::memory_order_acquire);
+                return false;
             }
         }
 
-        // Allocate
-        last_allocated_offset_ = arena_write_pos;
+        last_allocated_offset_ = arena_pos;
         last_allocated_size_ = aligned_size;
-        out_buffer_ptr = arena_base_ + arena_write_pos;
+        out_buffer_ptr = arena_base_ + arena_pos;
         out_slot_index = current_head;
         return true;
     }
@@ -161,7 +194,7 @@ public:
         header_->head.store(slot_index + 1, std::memory_order_release);
 
         // Wake consumer waiting on head
-        SyncWait::wake_one(header_->head);
+        wake_head();
     }
 
     // Helper: write contiguous buffer in one step
@@ -192,13 +225,14 @@ public:
             throw std::logic_error("read_acquire called while another lease is active; release previous frame first");
         }
 
-        const uint64_t current_tail = header_->tail.load(std::memory_order_relaxed);
+        uint64_t current_tail = header_->tail.load(std::memory_order_relaxed);
 
         // Wait for unread slots (head > tail)
         while (header_->head.load(std::memory_order_acquire) == current_tail) {
             if (is_shutdown()) return false;
-            if (!SyncWait::wait_change(header_->head, current_tail, spin_count, timeout_ms)) {
+            if (!wait_head(current_tail, spin_count, timeout_ms)) {
                 if (is_shutdown()) return false;
+                if (header_->head.load(std::memory_order_acquire) == current_tail) return false;
             }
         }
 
@@ -207,8 +241,6 @@ public:
         out_desc = slot;
         out_buffer_ptr = arena_base_ + slot.data_offset;
 
-        active_lease_offset_ = slot.data_offset;
-        active_lease_size_ = align_up(slot.data_size, 64);
         has_active_lease_ = true;
         return true;
     }
@@ -221,17 +253,12 @@ public:
 
         const uint64_t current_tail = header_->tail.load(std::memory_order_relaxed);
 
-        // Advance arena tail to free data space
-        header_->arena_tail.store(active_lease_offset_ + active_lease_size_, std::memory_order_release);
-
-        // Advance tail pointer
+        // Advance tail pointer to release slot and free arena memory
         header_->tail.store(current_tail + 1, std::memory_order_release);
-
         has_active_lease_ = false;
 
-        // Wake producer waiting on tail or arena_tail
-        SyncWait::wake_one(header_->tail);
-        SyncWait::wake_one(header_->arena_tail);
+        // Wake producer waiting on tail
+        wake_tail();
     }
 
     // RAII Frame Lease for Consumer
@@ -336,6 +363,75 @@ private:
         arena_base_ = base_ptr_ + header_offset + slots_size;
     }
 
+    void init_sync(const std::string& name) {
+#if defined(_WIN32)
+        std::wstring wname(name.begin(), name.end());
+        if (wname.rfind(L"Local\\", 0) != 0 && wname.rfind(L"Global\\", 0) != 0) {
+            wname = L"Local\\" + wname;
+        }
+        std::wstring h_name = wname + L"_h";
+        std::wstring t_name = wname + L"_t";
+        if (is_producer_) {
+            event_head_ = CreateEventW(NULL, FALSE, FALSE, h_name.c_str());
+            event_tail_ = CreateEventW(NULL, FALSE, FALSE, t_name.c_str());
+        } else {
+            event_head_ = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, h_name.c_str());
+            event_tail_ = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, t_name.c_str());
+        }
+#else
+        (void)name;
+#endif
+    }
+
+    void close_sync() noexcept {
+#if defined(_WIN32)
+        if (event_head_) { CloseHandle(event_head_); event_head_ = nullptr; }
+        if (event_tail_) { CloseHandle(event_tail_); event_tail_ = nullptr; }
+#endif
+    }
+
+    bool wait_tail(uint64_t current_tail, uint32_t spin_count, uint32_t timeout_ms) noexcept {
+        for (uint32_t i = 0; i < spin_count; ++i) {
+            if (header_->tail.load(std::memory_order_relaxed) != current_tail) return true;
+            SyncWait::cpu_pause();
+        }
+#if defined(_WIN32)
+        if (event_tail_) {
+            DWORD res = WaitForSingleObject(event_tail_, timeout_ms);
+            return res == WAIT_OBJECT_0 || header_->tail.load(std::memory_order_relaxed) != current_tail;
+        }
+#endif
+        return SyncWait::wait_change(header_->tail, current_tail, 0, timeout_ms);
+    }
+
+    bool wait_head(uint64_t current_tail, uint32_t spin_count, uint32_t timeout_ms) noexcept {
+        for (uint32_t i = 0; i < spin_count; ++i) {
+            if (header_->head.load(std::memory_order_relaxed) != current_tail) return true;
+            SyncWait::cpu_pause();
+        }
+#if defined(_WIN32)
+        if (event_head_) {
+            DWORD res = WaitForSingleObject(event_head_, timeout_ms);
+            return res == WAIT_OBJECT_0 || header_->head.load(std::memory_order_relaxed) != current_tail;
+        }
+#endif
+        return SyncWait::wait_change(header_->head, current_tail, 0, timeout_ms);
+    }
+
+    void wake_head() noexcept {
+#if defined(_WIN32)
+        if (event_head_) SetEvent(event_head_);
+#endif
+        SyncWait::wake_one(header_->head);
+    }
+
+    void wake_tail() noexcept {
+#if defined(_WIN32)
+        if (event_tail_) SetEvent(event_tail_);
+#endif
+        SyncWait::wake_one(header_->tail);
+    }
+
     std::unique_ptr<SharedMemoryRegion> region_;
     bool is_producer_ = false;
 
@@ -350,8 +446,11 @@ private:
 
     // Consumer state
     bool has_active_lease_ = false;
-    uint64_t active_lease_offset_ = 0;
-    uint64_t active_lease_size_ = 0;
+
+#if defined(_WIN32)
+    HANDLE event_head_ = nullptr;
+    HANDLE event_tail_ = nullptr;
+#endif
 };
 
 } // namespace ipc

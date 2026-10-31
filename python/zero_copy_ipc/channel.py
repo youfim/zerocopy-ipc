@@ -64,8 +64,8 @@ class ConsumerChannel:
     """
     High-level zero-copy shared memory IPC Consumer.
     """
-    def __init__(self, name: str):
-        self._core = _CoreConsumer(name)
+    def __init__(self, name: str, wait_ready_ms: int = 5000):
+        self._core = _CoreConsumer(name, wait_ready_ms)
         self._name = name
 
     @property
