@@ -51,6 +51,11 @@ struct SlotDescriptor {
 
 static_assert(sizeof(SlotDescriptor) % 8 == 0, "SlotDescriptor must be 8-byte aligned");
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4324) // structure was padded due to alignment specifier
+#endif
+
 struct SharedMemoryHeader {
     uint64_t magic;
     uint32_t version;
@@ -66,6 +71,10 @@ struct SharedMemoryHeader {
     alignas(kCacheLineSize) std::atomic<uint32_t> consumer_pid;
     alignas(kCacheLineSize) std::atomic<uint32_t> flags;
 };
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 static_assert(offsetof(SharedMemoryHeader, head) % kCacheLineSize == 0, "head must be cacheline-aligned");
 static_assert(offsetof(SharedMemoryHeader, tail) % kCacheLineSize == 0, "tail must be cacheline-aligned");
