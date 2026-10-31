@@ -1,0 +1,52 @@
+# Build directories
+build/
+bin/
+lib/
+out/
+dist/
+*.dir/
+
+# MSVC / Visual Studio
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.opensdf
+*.sdf
+*.suo
+*.user
+.vs/
+x64/
+x86/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# Python / scikit-build-core
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.egg-info/
+.eggs/
+_skbuild/
+wheelhouse/
+.pytest_cache/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# Temporary / OS
+.DS_Store
+Thumbs.db

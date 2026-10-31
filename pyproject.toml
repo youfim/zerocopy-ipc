@@ -1,0 +1,33 @@
+[build-system]
+requires = ["scikit-build-core>=0.10.0", "nanobind>=2.0.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "zero_copy_ipc"
+version = "0.1.0"
+description = "Ultra-low-latency zero-copy shared memory IPC between C++20 and Python (NumPy/PyTorch)"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Vladimir Dunaev", email = "youfim1337@gmail.com" }
+]
+dependencies = [
+    "numpy>=1.22.0"
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "torch"
+]
+
+[tool.scikit-build]
+cmake.version = ">=3.20"
+cmake.build-type = "Release"
+wheel.packages = ["python/zero_copy_ipc"]
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+BUILD_PYTHON_BINDINGS = "ON"
+BUILD_TESTS = "OFF"
+BUILD_BENCHMARKS = "OFF"
