@@ -3,8 +3,14 @@
 #include <cstdint>
 #include <atomic>
 #include <cstddef>
+#include <stdexcept>
 
 namespace ipc {
+
+class PeerDiedException : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 inline constexpr uint64_t kMagicNumber = 0x5A43504332304950ULL; // "ZCPC20IP"
 inline constexpr uint32_t kCurrentVersion = 1;

@@ -1,6 +1,6 @@
 from typing import Optional, Union, Any
 try:
-    from ._core import Producer as _CoreProducer, Consumer as _CoreConsumer, FrameLease, DataType
+    from ._core import Producer as _CoreProducer, Consumer as _CoreConsumer, FrameLease, DataType, PeerDiedError
 except ImportError:
     # Fallback when running against directly compiled .pyd in package directory
     import sys
@@ -8,7 +8,17 @@ except ImportError:
     pkg_dir = Path(__file__).resolve().parent
     if str(pkg_dir) not in sys.path:
         sys.path.insert(0, str(pkg_dir))
-    from _core import Producer as _CoreProducer, Consumer as _CoreConsumer, FrameLease, DataType
+    from _core import Producer as _CoreProducer, Consumer as _CoreConsumer, FrameLease, DataType, PeerDiedError
+
+def _frame_lease_to_torch(self):
+    """
+    Zero-copy export directly into a PyTorch Tensor sharing the underlying shared memory.
+    """
+    import torch
+    arr = self.to_numpy()
+    return torch.from_numpy(arr)
+
+FrameLease.to_torch = _frame_lease_to_torch
 
 class ProducerChannel:
     """

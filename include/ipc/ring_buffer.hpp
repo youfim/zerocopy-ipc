@@ -80,6 +80,7 @@ public:
         }
 
         buf->validate_header();
+        buf->header_->consumer_pid.store(detail::get_process_id(), std::memory_order_release);
         buf->init_sync(name);
         return std::unique_ptr<SpscRingBuffer>(buf);
     }
@@ -340,6 +341,8 @@ private:
         header_->tail.store(0, std::memory_order_relaxed);
         header_->arena_head.store(0, std::memory_order_relaxed);
         header_->arena_tail.store(0, std::memory_order_relaxed);
+        header_->producer_pid.store(detail::get_process_id(), std::memory_order_release);
+        header_->consumer_pid.store(0, std::memory_order_relaxed);
         header_->flags.store(ShmFlag_None, std::memory_order_relaxed);
 
         setup_pointers();
@@ -390,32 +393,70 @@ private:
 #endif
     }
 
-    bool wait_tail(uint64_t current_tail, uint32_t spin_count, uint32_t timeout_ms) noexcept {
+    bool wait_tail(uint64_t current_tail, uint32_t spin_count, uint32_t timeout_ms) {
         for (uint32_t i = 0; i < spin_count; ++i) {
             if (header_->tail.load(std::memory_order_relaxed) != current_tail) return true;
             SyncWait::cpu_pause();
         }
+
+        uint32_t cons_pid = header_->consumer_pid.load(std::memory_order_relaxed);
+        if (cons_pid != 0 && !detail::is_process_alive(cons_pid)) {
+            throw PeerDiedException("Consumer process (PID " + std::to_string(cons_pid) + ") died unexpectedly");
+        }
+
 #if defined(_WIN32)
         if (event_tail_) {
             DWORD res = WaitForSingleObject(event_tail_, timeout_ms);
+            if (res == WAIT_TIMEOUT) {
+                cons_pid = header_->consumer_pid.load(std::memory_order_relaxed);
+                if (cons_pid != 0 && !detail::is_process_alive(cons_pid)) {
+                    throw PeerDiedException("Consumer process (PID " + std::to_string(cons_pid) + ") died unexpectedly");
+                }
+            }
             return res == WAIT_OBJECT_0 || header_->tail.load(std::memory_order_relaxed) != current_tail;
         }
 #endif
-        return SyncWait::wait_change(header_->tail, current_tail, 0, timeout_ms);
+        bool ok = SyncWait::wait_change(header_->tail, current_tail, 0, timeout_ms);
+        if (!ok) {
+            cons_pid = header_->consumer_pid.load(std::memory_order_relaxed);
+            if (cons_pid != 0 && !detail::is_process_alive(cons_pid)) {
+                throw PeerDiedException("Consumer process (PID " + std::to_string(cons_pid) + ") died unexpectedly");
+            }
+        }
+        return ok;
     }
 
-    bool wait_head(uint64_t current_tail, uint32_t spin_count, uint32_t timeout_ms) noexcept {
+    bool wait_head(uint64_t current_tail, uint32_t spin_count, uint32_t timeout_ms) {
         for (uint32_t i = 0; i < spin_count; ++i) {
             if (header_->head.load(std::memory_order_relaxed) != current_tail) return true;
             SyncWait::cpu_pause();
         }
+
+        uint32_t prod_pid = header_->producer_pid.load(std::memory_order_relaxed);
+        if (prod_pid != 0 && !detail::is_process_alive(prod_pid)) {
+            throw PeerDiedException("Producer process (PID " + std::to_string(prod_pid) + ") died unexpectedly");
+        }
+
 #if defined(_WIN32)
         if (event_head_) {
             DWORD res = WaitForSingleObject(event_head_, timeout_ms);
+            if (res == WAIT_TIMEOUT) {
+                prod_pid = header_->producer_pid.load(std::memory_order_relaxed);
+                if (prod_pid != 0 && !detail::is_process_alive(prod_pid)) {
+                    throw PeerDiedException("Producer process (PID " + std::to_string(prod_pid) + ") died unexpectedly");
+                }
+            }
             return res == WAIT_OBJECT_0 || header_->head.load(std::memory_order_relaxed) != current_tail;
         }
 #endif
-        return SyncWait::wait_change(header_->head, current_tail, 0, timeout_ms);
+        bool ok = SyncWait::wait_change(header_->head, current_tail, 0, timeout_ms);
+        if (!ok) {
+            prod_pid = header_->producer_pid.load(std::memory_order_relaxed);
+            if (prod_pid != 0 && !detail::is_process_alive(prod_pid)) {
+                throw PeerDiedException("Producer process (PID " + std::to_string(prod_pid) + ") died unexpectedly");
+            }
+        }
+        return ok;
     }
 
     void wake_head() noexcept {

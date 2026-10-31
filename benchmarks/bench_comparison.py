@@ -1,5 +1,6 @@
 import time
 import multiprocessing as mp
+import socket
 import numpy as np
 from zero_copy_ipc import ProducerChannel, ConsumerChannel
 
@@ -75,24 +76,83 @@ def bench_multiprocessing_queue():
     bandwidth = mb_transferred / elapsed
     return elapsed, fps, bandwidth
 
+def _tcp_server_worker(port, num_frames, ready_event):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(1)
+    ready_event.set()
+    conn, _ = srv.accept()
+    frame = np.ones(FRAME_SHAPE, dtype=FRAME_DTYPE).tobytes()
+    for _ in range(num_frames):
+        conn.sendall(frame)
+    conn.close()
+    srv.close()
+
+def _tcp_client_worker(port, num_frames, ready_event, res_q):
+    ready_event.wait()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.connect(("127.0.0.1", port))
+
+    buf = bytearray(FRAME_BYTES)
+    view = memoryview(buf)
+    t0 = time.perf_counter()
+    for _ in range(num_frames):
+        remaining = FRAME_BYTES
+        offset = 0
+        while remaining > 0:
+            n = sock.recv_into(view[offset:], remaining)
+            if not n:
+                break
+            offset += n
+            remaining -= n
+    t1 = time.perf_counter()
+    sock.close()
+    res_q.put(t1 - t0)
+
+def bench_tcp_socket():
+    port = 54321
+    res_q = mp.Queue()
+    ready_event = mp.Event()
+    p1 = mp.Process(target=_tcp_server_worker, args=(port, NUM_FRAMES, ready_event))
+    p2 = mp.Process(target=_tcp_client_worker, args=(port, NUM_FRAMES, ready_event, res_q))
+
+    p1.start()
+    p2.start()
+    p1.join()
+    p2.join()
+
+    elapsed = res_q.get()
+    mb_transferred = (FRAME_BYTES * NUM_FRAMES) / (1024 * 1024)
+    fps = NUM_FRAMES / elapsed
+    bandwidth = mb_transferred / elapsed
+    return elapsed, fps, bandwidth
+
 def main():
-    print("=" * 65)
+    print("=" * 70)
     print("      IPC Benchmark Comparison: 1080p RGB Frames (6.22 MB)")
     print(f"      Total Transferred: {NUM_FRAMES} frames (~{(FRAME_BYTES * NUM_FRAMES) / (1024*1024):.1f} MB)")
-    print("=" * 65)
+    print("=" * 70)
 
     print("\nRunning multiprocessing.Queue benchmark...")
     mp_time, mp_fps, mp_bw = bench_multiprocessing_queue()
-    print(f"multiprocessing.Queue     : {mp_time:.3f} s | {mp_fps:.1f} FPS | {mp_bw:.1f} MB/s")
+    print(f"multiprocessing.Queue     : {mp_time:.3f} s | {mp_fps:6.1f} FPS | {mp_bw:7.1f} MB/s")
+
+    print("\nRunning TCP loopback socket benchmark...")
+    tcp_time, tcp_fps, tcp_bw = bench_tcp_socket()
+    print(f"TCP loopback socket       : {tcp_time:.3f} s | {tcp_fps:6.1f} FPS | {tcp_bw:7.1f} MB/s")
 
     print("\nRunning zero-copy shared memory IPC benchmark...")
     zc_time, zc_fps, zc_bw = bench_zerocopy_ipc()
-    print(f"zero-copy IPC (nanobind)  : {zc_time:.3f} s | {zc_fps:.1f} FPS | {zc_bw:.1f} MB/s")
+    print(f"zero-copy IPC (nanobind)  : {zc_time:.3f} s | {zc_fps:6.1f} FPS | {zc_bw:7.1f} MB/s")
 
-    speedup = zc_bw / mp_bw if mp_bw > 0 else 0
-    print("\n" + "=" * 65)
-    print(f"Speedup: {speedup:.1f}x higher throughput over multiprocessing.Queue")
-    print("=" * 65)
+    speedup_mp = zc_bw / mp_bw if mp_bw > 0 else 0
+    speedup_tcp = zc_bw / tcp_bw if tcp_bw > 0 else 0
+    print("\n" + "=" * 70)
+    print(f"Speedup vs multiprocessing.Queue : {speedup_mp:.1f}x higher throughput")
+    print(f"Speedup vs TCP loopback sockets   : {speedup_tcp:.1f}x higher throughput")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()

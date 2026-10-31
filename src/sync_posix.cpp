@@ -10,6 +10,7 @@
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <unistd.h>
+#include <signal.h>
 
 namespace ipc::detail {
 
@@ -56,6 +57,16 @@ void os_wake_all(volatile const void* address) {
     futex_wake(address, INT_MAX);
 }
 
+uint32_t get_process_id() noexcept {
+    return static_cast<uint32_t>(getpid());
+}
+
+bool is_process_alive(uint32_t pid) noexcept {
+    if (pid == 0) return true;
+    if (kill(static_cast<pid_t>(pid), 0) == 0) return true;
+    return errno == EPERM;
+}
+
 } // namespace ipc::detail
 
 #else // Generic POSIX fallback (e.g. macOS)
@@ -95,6 +106,14 @@ bool os_wait_u32(volatile const void* address, uint32_t compare_val, uint32_t ti
 
 void os_wake_single(volatile const void* /*address*/) {}
 void os_wake_all(volatile const void* /*address*/) {}
+
+uint32_t get_process_id() noexcept {
+    return 0;
+}
+
+bool is_process_alive(uint32_t /*pid*/) noexcept {
+    return true;
+}
 
 } // namespace ipc::detail
 

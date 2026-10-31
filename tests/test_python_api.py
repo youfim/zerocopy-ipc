@@ -94,6 +94,12 @@ def _consumer_proc(name, count, return_queue):
                 received += 1
     return_queue.put(received)
 
+def _crash_producer_proc(name, ready_event):
+    prod = ProducerChannel(name, ring_capacity=16, data_arena_capacity=1024*1024)
+    prod.send_bytes(b"initial_frame")
+    ready_event.set()
+    time.sleep(60)
+
 class TestCrossProcessIpc(unittest.TestCase):
     def test_multiprocess_tensor_stream(self):
         name = "test_py_mproc"
@@ -101,7 +107,6 @@ class TestCrossProcessIpc(unittest.TestCase):
         q = mp.Queue()
 
         p_prod = mp.Process(target=_producer_proc, args=(name, count))
-        # Start producer process first
         p_prod.start()
         time.sleep(0.05)
 
@@ -114,6 +119,28 @@ class TestCrossProcessIpc(unittest.TestCase):
         self.assertFalse(q.empty(), "Consumer did not return result")
         result = q.get()
         self.assertEqual(result, count, f"Failed multiprocess test with result: {result}")
+
+    def test_peer_crash_detection(self):
+        from zero_copy_ipc import PeerDiedError
+        name = "test_py_crash"
+        ready = mp.Event()
+
+        p_prod = mp.Process(target=_crash_producer_proc, args=(name, ready))
+        p_prod.start()
+
+        ready.wait(timeout=5)
+        with ConsumerChannel(name) as cons:
+            with cons.receive(timeout_ms=1000) as frame:
+                self.assertIsNotNone(frame)
+                self.assertEqual(frame.to_bytes(), b"initial_frame")
+
+            # Forcibly terminate producer process
+            p_prod.terminate()
+            p_prod.join(timeout=3)
+
+            # Next receive must immediately raise PeerDiedError instead of waiting
+            with self.assertRaises(PeerDiedError):
+                _ = cons.receive(timeout_ms=1000)
 
 if __name__ == "__main__":
     unittest.main()

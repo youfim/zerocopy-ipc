@@ -19,6 +19,8 @@ namespace detail {
     bool os_wait_u32(volatile const void* address, uint32_t compare_val, uint32_t timeout_ms);
     void os_wake_single(volatile const void* address);
     void os_wake_all(volatile const void* address);
+    uint32_t get_process_id() noexcept;
+    bool is_process_alive(uint32_t pid) noexcept;
 } // namespace detail
 
 class SyncWait {

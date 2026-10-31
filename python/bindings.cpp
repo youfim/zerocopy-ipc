@@ -278,6 +278,8 @@ NB_MODULE(_core, m) {
         .value("Float64", ipc::DataType::Float64)
         .export_values();
 
+    nb::exception<ipc::PeerDiedException>(m, "PeerDiedError", PyExc_RuntimeError);
+
     nb::class_<PyFrameLease>(m, "FrameLease")
         .def("is_valid", &PyFrameLease::is_valid)
         .def("size", &PyFrameLease::size)
